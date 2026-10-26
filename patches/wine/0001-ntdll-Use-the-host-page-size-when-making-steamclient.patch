@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Sun, 25 Oct 2026 21:41:44 -0700
+Subject: [PATCH] ntdll: Use the host page size when making steamclient code
+ writable.
+
+steamclient_setup_trampolines() rounds the .text section to the Windows page size before calling mprotect(), which fails with EINVAL on hosts with larger pages (e.g. 16K on Apple Silicon) when .text is not host page aligned; the subsequent trampoline writes then fault, leaving the native steamclient.dll unpatched and games reporting that Steam is not running. Round to the host page size instead and account for the start offset so the whole section is covered.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/loader.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 6cf894f3848..dbd23ca9978 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1189,7 +1189,6 @@ static NTSTATUS steamclient_setup_trampolines( void *args )
+ 
+     struct steamclient_setup_trampolines_params *params = args;
+     HMODULE src_mod = params->src_mod, tgt_mod = params->tgt_mod;
+-    SYSTEM_BASIC_INFORMATION info;
+     IMAGE_NT_HEADERS *src_nt = get_rva( src_mod, ((IMAGE_DOS_HEADER *)src_mod)->e_lfanew );
+     IMAGE_NT_HEADERS *tgt_nt = get_rva( tgt_mod, ((IMAGE_DOS_HEADER *)tgt_mod)->e_lfanew );
+     IMAGE_SECTION_HEADER *src_sec = IMAGE_FIRST_SECTION( src_nt );
+@@ -1199,20 +1198,21 @@ static NTSTATUS steamclient_setup_trampolines( void *args )
+     SIZE_T size;
+     void *addr, *src_addr, *tgt_addr;
+     char *name, *wsne;
+-    UINT_PTR page_mask;
++    UINT_PTR start, page_mask;
+     int i;
+ 
+     if (noexec_cached == -1)
+         noexec_cached = (wsne = getenv("WINESTEAMNOEXEC")) && atoi(wsne);
+ 
+-    virtual_get_system_info( &info, !!NtCurrentTeb()->WowTebOffset );
+-    page_mask = info.PageSize - 1;
++    /* mprotect() works on host pages, which may be larger than the Windows page size. */
++    page_mask = sysconf( _SC_PAGESIZE ) - 1;
+ 
+     for (i = 0; i < src_nt->FileHeader.NumberOfSections; ++i)
+     {
+         if (memcmp(src_sec[i].Name, ".text", 5)) continue;
+-        addr = (void *)(((UINT_PTR)src_mod + src_sec[i].VirtualAddress) & ~page_mask);
+-        size = (src_sec[i].Misc.VirtualSize + page_mask) & ~page_mask;
++        start = (UINT_PTR)src_mod + src_sec[i].VirtualAddress;
++        addr = (void *)(start & ~page_mask);
++        size = (src_sec[i].Misc.VirtualSize + (start & page_mask) + page_mask) & ~page_mask;
+         if (noexec_cached) mprotect(addr, size, PROT_READ);
+         else mprotect(addr, size, PROT_READ|PROT_WRITE|PROT_EXEC);
+     }
+-- 
+2.56.0
+
