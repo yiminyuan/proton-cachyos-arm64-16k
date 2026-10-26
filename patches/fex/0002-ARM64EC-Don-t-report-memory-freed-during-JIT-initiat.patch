@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Mon, 26 Oct 2026 16:36:34 -0700
+Subject: [PATCH 2/3] ARM64EC: Don't report memory freed during JIT-initiated
+ invalidation
+
+InvalidateGuestCodeRange is called by FEXCore from the JIT, e.g. when full SMC detection finds modified code, and the invalidation it performs frees memory through VirtualDontNeed while holding CodeInvalidationMutex. Unlike the invalidations performed from Wine's callbacks, nothing disabled syscall callbacks here, so the free was reported back to NotifyMemoryFree, which invalidates again and deadlocks on CodeInvalidationMutex. Disable syscall callbacks for the duration, and hold ThreadCreationMutex as the invalidation iterates over all threads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/ARM64EC/Module.cpp | 35 +++++++++++++++++--------------
+ 1 file changed, 19 insertions(+), 16 deletions(-)
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 633f252c3..46fa7f740 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -165,6 +165,22 @@ ThreadCPUArea GetCPUArea() {
+   return ThreadCPUArea(NtCurrentTeb());
+ }
+ 
++class ScopedCallbackDisable {
++private:
++  bool Prev;
++
++public:
++  ScopedCallbackDisable() {
++    const auto CPUArea = GetCPUArea();
++    Prev = CPUArea.Area->InSyscallCallback;
++    CPUArea.Area->InSyscallCallback = true;
++  }
++
++  ~ScopedCallbackDisable() {
++    GetCPUArea().Area->InSyscallCallback = Prev;
++  }
++};
++
+ FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
+   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
+ }
+@@ -603,6 +619,9 @@ public:
+   }
+ 
+   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
++    // Invalidation frees memory, which mustn't be reported back to FEX while CodeInvalidationMutex is held
++    ScopedCallbackDisable guard;
++    std::scoped_lock Lock(ThreadCreationMutex);
+     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
+   }
+ 
+@@ -718,22 +737,6 @@ NTSTATUS ProcessInit() {
+ 
+ void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+ 
+-class ScopedCallbackDisable {
+-private:
+-  bool Prev;
+-
+-public:
+-  ScopedCallbackDisable() {
+-    const auto CPUArea = GetCPUArea();
+-    Prev = CPUArea.Area->InSyscallCallback;
+-    CPUArea.Area->InSyscallCallback = true;
+-  }
+-
+-  ~ScopedCallbackDisable() {
+-    GetCPUArea().Area->InSyscallCallback = Prev;
+-  }
+-};
+-
+ // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
+ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+   auto Thread = CPUArea.ThreadState();
+-- 
+2.56.0
+
