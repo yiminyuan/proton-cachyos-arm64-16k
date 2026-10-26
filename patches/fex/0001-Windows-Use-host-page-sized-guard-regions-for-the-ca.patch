@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Sun, 25 Oct 2026 22:14:31 -0700
+Subject: [PATCH] Windows: Use host page sized guard regions for the call-ret
+ stack
+
+Under Wine on hosts with pages larger than 4KiB (e.g. 16KiB on Apple Silicon), the 4KiB guard pages share a host page with the committed stack and are therefore accessible, so a call-ret stack underflow only faults once it runs past the allocation, outside of the range HandleAccessViolation recovers from, and is instead raised to the guest as an access violation, repeating until the thread's stack overflows. Size the guard regions to the 64KiB allocation granularity, a multiple of any supported host page size, so they always fault within the recoverable range.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/Common/CallRetStack.h | 18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/Source/Windows/Common/CallRetStack.h b/Source/Windows/Common/CallRetStack.h
+index 215591b39..1c41ddfce 100644
+--- a/Source/Windows/Common/CallRetStack.h
++++ b/Source/Windows/Common/CallRetStack.h
+@@ -7,6 +7,11 @@
+ #include <FEXCore/Debug/InternalThreadState.h>
+ 
+ namespace FEX::Windows::CallRetStack {
++// Wine on hosts with pages larger than 4KiB can't protect individual 4KiB pages, so make the guard regions span the
++// allocation granularity, which is a multiple of any supported host page size.
++constexpr size_t GuardSize = 0x10000;
++constexpr size_t AllocationSize = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * GuardSize;
++
+ struct CallRetStackInfo {
+   uint64_t AllocationBase;
+   uint64_t AllocationEnd;
+@@ -16,21 +21,18 @@ struct CallRetStackInfo {
+ CallRetStackInfo GetInfoThread(FEXCore::Core::InternalThreadState* Thread) {
+   uint64_t Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
+   // Leave some room from the base for the default location to allow for underflows without constant exceptions
+-  return {Base - FEXCore::Utils::FEX_PAGE_SIZE, Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + FEXCore::Utils::FEX_PAGE_SIZE,
++  return {Base - GuardSize, Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + GuardSize,
+           Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4};
+ }
+ 
+ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
+   // Allocate the call-ret stack with guard pages on both sides
+-  const void* CallRetStackAlloc = ::VirtualAlloc(nullptr, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE,
+-                                                 MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
++  const void* CallRetStackAlloc = ::VirtualAlloc(nullptr, AllocationSize, MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
+ 
+-  FEXCore::Allocator::VirtualName("FEXMem_CallRetStacks", CallRetStackAlloc,
+-                                  FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE);
+-  FEXCore::Allocator::VirtualTHPControl(CallRetStackAlloc, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE,
+-                                        FEXCore::Allocator::THPControl::Disable);
++  FEXCore::Allocator::VirtualName("FEXMem_CallRetStacks", CallRetStackAlloc, AllocationSize);
++  FEXCore::Allocator::VirtualTHPControl(CallRetStackAlloc, AllocationSize, FEXCore::Allocator::THPControl::Disable);
+ 
+-  Thread->CallRetStackBase = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(CallRetStackAlloc) + FEXCore::Utils::FEX_PAGE_SIZE);
++  Thread->CallRetStackBase = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(CallRetStackAlloc) + GuardSize);
+   ::VirtualAlloc(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, MEM_COMMIT, PAGE_READWRITE);
+ 
+   Thread->CurrentFrame->State.callret_sp = GetInfoThread(Thread).DefaultLocation;
+-- 
+2.56.0
+

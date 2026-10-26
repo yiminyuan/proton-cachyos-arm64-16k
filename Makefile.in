@@ -1360,7 +1360,8 @@ $(eval $(call rules-source,fex,$(SRCDIR)/FEX))
 $(eval $(call rules-cmake,fex,aarch64,windows))
 $(eval $(call rules-cmake,fex,arm64ec,windows))
 
-$(OBJ)/.fex-post-source:
+$(OBJ)/.fex-post-source: patches-source
+	$(foreach p,$(shell find $(PATCHES_SRC)/fex/ -name "*.patch" | sort),patch -d $(FEX_SRC) -Np1 -i $(p) &&) true
 	git -C $(SRCDIR)/FEX describe --abbrev=7 > $(FEX_SRC)/.git_describe
 	git -C $(SRCDIR)/FEX rev-parse --short=7 HEAD > $(FEX_SRC)/.git_rev
 	touch $@
