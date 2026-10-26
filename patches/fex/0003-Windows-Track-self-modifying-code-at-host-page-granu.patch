@@ -1,0 +1,660 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Mon, 26 Oct 2026 14:31:52 -0700
+Subject: [PATCH 3/3] Windows: Track self-modifying code at host page
+ granularity
+
+Under Wine on hosts with pages larger than 4KiB (e.g. 16KiB on Apple Silicon), page protections only apply to whole host pages, so trapping individual 4KiB pages of RWX intervals left them writable whenever another page of their host page was, and untrapping a faulting page made its whole host page writable while only that page was invalidated; the resulting undetected writes left stale code running, crashing JITs such as V8. Query the host page size through the unix library, trap, untrap and invalidate whole host pages, and single step inline self-modifying code anywhere in the untrapped host page. A host page whose other pages hold data would fault on every write to that data, so once a write faults on a page no code was compiled from, or the host page contains writable pages outside of RWX intervals, stop trapping it and validate code from it before execution instead: ExecutableRangeInfo reports such ranges, the frontend enables full SMC detection for blocks with code from them, and the disk cache neither stores nor reuses such code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/DiskCache.cpp   |  23 +++
+ FEXCore/Source/Interface/Core/DiskCache.h     |   1 +
+ FEXCore/Source/Interface/Core/Frontend.cpp    |  12 ++
+ FEXCore/Source/Interface/Core/Frontend.h      |   5 +-
+ FEXCore/include/FEXCore/HLE/SyscallHandler.h  |   2 +
+ Source/Windows/ARM64EC/Module.cpp             |   4 +-
+ Source/Windows/Common/FEXUnixLib.cpp          |  12 ++
+ Source/Windows/Common/FEXUnixLib.h            |   4 +
+ Source/Windows/Common/InvalidationTracker.cpp | 174 ++++++++++++++----
+ Source/Windows/Common/InvalidationTracker.h   |  31 ++++
+ Source/Windows/UnixLib/FEXUnixLib.cpp         |   7 +
+ Source/Windows/UnixLib/FEXUnixLib.h           |   6 +
+ Source/Windows/WOW64/Module.cpp               |   4 +-
+ 13 files changed, 246 insertions(+), 39 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index 1ddd90568..b689ff751 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -500,6 +500,20 @@ namespace DiskCache {
+     return XXH3_64bits(&BlobKeyBytes, sizeof(BlobKeyBytes));
+   }
+ 
++  bool DiskCache::ExtentsRequireFullSMCDetection(Core::InternalThreadState* Thread, uint64_t GuestRIP, const fextl::vector<uint32_t>& GuestExtents) {
++    for (uint32_t i = 0; i < GuestExtents.size(); i += 2) {
++      const uint64_t End = GuestRIP + GuestExtents[i] + GuestExtents[i + 1];
++      for (uint64_t Address = GuestRIP + GuestExtents[i]; Address < End;) {
++        auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, Address);
++        if (RangeInfo.Size == 0 || RangeInfo.ForceFullSMCDetection) {
++          return true;
++        }
++        Address = RangeInfo.Base + RangeInfo.Size;
++      }
++    }
++    return false;
++  }
++
+   struct DiskCache::PruneMemoryLRUWorkItem final : WorkQueueThread::WorkItem {
+     DiskCache* Self;
+     PruneMemoryLRUWorkItem(DiskCache* Self)
+@@ -757,6 +771,11 @@ namespace DiskCache {
+ 
+     IndexEntry& Entry = *EntryUnderReview;
+ 
++    // Blocks with code from ranges requiring full SMC detection are never stored, but ranges can start requiring it later.
++    if (ExtentsRequireFullSMCDetection(Thread, GuestRIP, Entry.GuestExtents)) {
++      return std::nullopt;
++    }
++
+     fextl::vector<uint64_t> GuestPages;
+     for (uint32_t i = 0; i < Entry.GuestExtents.size(); i += 2) {
+       uint64_t FirstPage = (Entry.GuestExtents[i] + GuestRIP) & Utils::FEX_PAGE_MASK;
+@@ -980,6 +999,10 @@ namespace DiskCache {
+     if (!DecodedBlockInfo) {
+       return false;
+     }
++    // Lookups reject code from ranges requiring full SMC detection, see ExtentsRequireFullSMCDetection
++    if (DecodedBlockInfo->HasFullSMCDetectionRangeCode) {
++      return false;
++    }
+     // check for any reloc targets outside of our jurisdiction
+     // todo what are they exactly? caching those blocks is great when it works, so need to figure this out and make finer-grained if we can
+     if (RelocationFilter && Region) {
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index ab0264d89..33321b1f4 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -212,6 +212,7 @@ namespace DiskCache {
+   private:
+     bool OpenCacheDB(const fextl::string& CacheDBName, bool ReadOnly);
+     uint64_t MakeLookupKey(Core::InternalThreadState* Thread, const uint64_t ModuleOffset, bool Writable, bool MonoBackpatcher);
++    bool ExtentsRequireFullSMCDetection(Core::InternalThreadState* Thread, uint64_t GuestRIP, const fextl::vector<uint32_t>& GuestExtents);
+     IndexEntry* LookupLocked(const uint64_t LookupKey, const XXH128_hash_t& GuestHash, const uint64_t GuestFootprint);
+ 
+     bool ReadingDiskCache {};
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 78d5f1a2e..ac360a06f 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -99,11 +99,14 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+     ExecutableRangeBase = RangeInfo.Base;
+     ExecutableRangeEnd = RangeInfo.Base + RangeInfo.Size;
+     ExecutableRangeWritable = RangeInfo.Writable;
++    ExecutableRangeForceFullSMCDetection = RangeInfo.ForceFullSMCDetection;
+ 
+     if (RangeInfo.Size == 0) {
+       return false;
+     }
+ 
++    HitFullSMCDetectionRange |= ExecutableRangeForceFullSMCDetection;
++
+     uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
+     if (Size > RangeRemainingSize) {
+       Size -= RangeRemainingSize;
+@@ -111,6 +114,7 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+     }
+   }
+ 
++  HitFullSMCDetectionRange |= ExecutableRangeForceFullSMCDetection;
+   return true;
+ }
+ 
+@@ -1077,6 +1081,8 @@ void Decoder::DecodeREXIfValid(int8_t ExpectedOffset) {
+ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
+   // Will be set if DecodeInstructionImpl tries to read non-executable memory
+   HitNonExecutableRange = false;
++  // Will be set if DecodeInstructionImpl reads memory requiring full SMC detection
++  HitFullSMCDetectionRange = false;
+   HitBadRelocation = false;
+   auto ErrorDuringDecoding = DecodeInstructionImpl(PC);
+ 
+@@ -1319,6 +1325,7 @@ void Decoder::AddBranchTarget(uint64_t Target) {
+           .NumInstructions = BlockIt->NumInstructions - SplitIdx,
+           .DecodedInstructions = BlockIt->DecodedInstructions + SplitIdx,
+           .BlockStatus = BlockIt->BlockStatus,
++          .ForceFullSMCDetection = BlockIt->ForceFullSMCDetection,
+         };
+ 
+         if (BlockIt->DataMasks.size()) {
+@@ -1625,6 +1632,10 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
+       }
+ 
+       EraseBlock = false; // Block contains at least one valid instruction, so unset erase
++      if (HitFullSMCDetectionRange) {
++        BlockIt->ForceFullSMCDetection = true;
++        BlockInfo.HasFullSMCDetectionRangeCode = true;
++      }
+       ++TotalInstructions;
+       ++DecodedSize;
+       ++BlockIt->NumInstructions;
+@@ -1742,6 +1753,7 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
+   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
+   BlockInfo.TotalInstructionCount = 0;
+   BlockInfo.Blocks.clear();
++  BlockInfo.HasFullSMCDetectionRangeCode = false;
+   VisitedBlocks.clear();
+   // Reset internal state management
+   Paused = false;
+diff --git a/FEXCore/Source/Interface/Core/Frontend.h b/FEXCore/Source/Interface/Core/Frontend.h
+index 1fc0e6ed3..ff7756681 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.h
++++ b/FEXCore/Source/Interface/Core/Frontend.h
+@@ -57,7 +57,8 @@ public:
+     bool Is64BitMode {};
+     fextl::vector<DecodedBlocks> Blocks;
+     fextl::set<uint64_t> EntryPoints;
+-    fextl::set<uint64_t> CodePages; // Start addresses of all pages touching the block
++    fextl::set<uint64_t> CodePages;       // Start addresses of all pages touching the block
++    bool HasFullSMCDetectionRangeCode {}; // Contains code from a range requiring full SMC detection
+   };
+ 
+   Decoder(FEXCore::Core::InternalThreadState* Thread);
+@@ -151,7 +152,9 @@ private:
+   uint64_t ExecutableRangeBase {};
+   uint64_t ExecutableRangeEnd {};
+   bool ExecutableRangeWritable {};
++  bool ExecutableRangeForceFullSMCDetection {};
+   bool HitNonExecutableRange {};
++  bool HitFullSMCDetectionRange {};
+   bool HitBadRelocation {};
+ 
+   struct DecodeStream {
+diff --git a/FEXCore/include/FEXCore/HLE/SyscallHandler.h b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+index 0ba0218e3..8d22e92f1 100644
+--- a/FEXCore/include/FEXCore/HLE/SyscallHandler.h
++++ b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+@@ -21,6 +21,8 @@ struct ExecutableRangeInfo {
+   uint64_t Base;
+   uint64_t Size;
+   bool Writable;
++  // Writes to the range can't be detected through memory protection, so code from it must be validated before execution.
++  bool ForceFullSMCDetection {};
+ };
+ 
+ class SyscallHandler;
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 46fa7f740..6c97bbb41 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -767,8 +767,10 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+     std::scoped_lock Lock(ThreadCreationMutex);
+     if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress)) {
+       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
++      // The whole host page containing the fault is now writable, so further writes to it from the current block will not fault.
++      const auto WritableInterval = InvalidationTracker->HostPageInterval(FaultAddress, 1);
+       if (CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc) && !CTX->IsCurrentBlockSingleInst(CPUArea.ThreadState()) &&
+-          CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
++          CTX->IsAddressInCurrentBlock(Thread, WritableInterval.Offset, WritableInterval.End - WritableInterval.Offset)) {
+         // If we are not patching ourself (single inst block case) and potentially patching the current block, this is inline SMC. Reconstruct the current context (before the SMC write) then single step the write to reduce it to regular SMC.
+         Exception::ReconstructThreadState(Thread, *NativeContext);
+         LogMan::Msg::DFmt("Handled inline self-modifying code: pc: {:X} rip: {:X} fault: {:X}", NativeContext->Pc,
+diff --git a/Source/Windows/Common/FEXUnixLib.cpp b/Source/Windows/Common/FEXUnixLib.cpp
+index e37807fda..a26a495c3 100644
+--- a/Source/Windows/Common/FEXUnixLib.cpp
++++ b/Source/Windows/Common/FEXUnixLib.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MIT
+ #include <FEXCore/fextl/fmt.h>
+ #include <FEXCore/Utils/LogManager.h>
++#include <FEXCore/Utils/TypeDefines.h>
+ 
+ #include <cstdint>
+ #include <windef.h>
+@@ -210,4 +211,15 @@ uint32_t GetPID() {
+   return GetCurrentProcessId();
+ }
+ 
++uint64_t GetHostPageSize() {
++  if (Available()) {
++    FEXUnixLib_GetHostPageSize Args {};
++    if (!Call(FEXUnixLibFunctions::GetHostPageSize, &Args)) {
++      return Args.Result;
++    }
++  }
++
++  return FEXCore::Utils::FEX_PAGE_SIZE;
++}
++
+ } // namespace FEX::Windows::UnixLib
+diff --git a/Source/Windows/Common/FEXUnixLib.h b/Source/Windows/Common/FEXUnixLib.h
+index c62a763a8..b3b8b64ef 100644
+--- a/Source/Windows/Common/FEXUnixLib.h
++++ b/Source/Windows/Common/FEXUnixLib.h
+@@ -53,4 +53,8 @@ void* MapFile(HANDLE FileHandle, uint64_t MapSize);
+ // Or returns the process ID otherwise.
+ uint32_t GetPID();
+ 
++// Returns the host page size when unixlib is available, which can be larger than the 4KiB page size seen by Windows code.
++// Or returns FEX_PAGE_SIZE otherwise.
++uint64_t GetHostPageSize();
++
+ } // namespace FEX::Windows::UnixLib
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 155403d35..810903f39 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -7,13 +7,16 @@
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include "InvalidationTracker.h"
++#include "FEXUnixLib.h"
++#include <optional>
+ #include <windef.h>
+ #include <winternl.h>
+ 
+ namespace FEX::Windows {
+ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
+   : CTX {CTX}
+-  , Threads {Threads} {
++  , Threads {Threads}
++  , HostPageMask {~(UnixLib::GetHostPageSize() - 1)} {
+   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
+   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+ 
+@@ -47,14 +50,21 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+   const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+ 
+-  const bool NeedsInvalidate = [&]() {
++  const auto Invalidate = [&]() -> std::optional<FEXCore::IntervalList<uint64_t>::Interval> {
+     std::unique_lock Lock(IntervalsLock);
+ 
+     FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
+ 
++    // Making the range writable makes the host pages containing it writable, so writes to trapped RWX intervals sharing those host
++    // pages no longer fault and any code from them must be invalidated too.
++    const auto HostInterval = HostPageInterval(AlignedBase, AlignedSize);
++    const bool InvalidateHostPages = ProtIsWritable(Prot) && RWXIntervals.Intersect(HostInterval);
++    const auto InvalidateInterval = InvalidateHostPages ? HostInterval : ProtInterval;
++
+     const bool HasExec = ProtHasExec(Prot);
+     const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
+     const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
++    bool Changed = false;
+ 
+     if (EffectiveExec) {
+       XIntervals.Insert(ProtInterval);
+@@ -65,22 +75,33 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+       if (DEPDisabled && !HasExec) {
+         DEPPromotedIntervals.Insert(ProtInterval);
+       }
+-      return true;
++      Changed = true;
+     } else if (XIntervals.Intersect(ProtInterval)) {
+       XIntervals.Remove(ProtInterval);
+       RWXIntervals.Remove(ProtInterval);
+       if (DEPDisabled) {
+         DEPPromotedIntervals.Remove(ProtInterval);
+       }
+-      return true;
++      Changed = true;
+     }
+ 
+-    return false;
++    // Writable pages outside of RWX intervals are never trapped, so the host pages they share with RWX intervals can't be write
++    // protected and code from them must be validated before execution instead.
++    if (HostPageMask != FEXCore::Utils::FEX_PAGE_MASK && ProtIsWritable(Prot) && RWXIntervals.Intersect(HostInterval) &&
++        HasUntrackedWritablePages(HostInterval)) {
++      LogMan::Msg::DFmt("Add full SMC detection interval: {:X} - {:X}", HostInterval.Offset, HostInterval.End);
++      FullSMCDetectionIntervals.Insert(HostInterval);
++    }
++
++    if (Changed || InvalidateHostPages) {
++      return InvalidateInterval;
++    }
++    return std::nullopt;
+   }();
+ 
+-  if (NeedsInvalidate) {
++  if (Invalidate) {
+     // IntervalsLock cannot be held during invalidation
+-    InvalidateIntervalInternal(AlignedBase, AlignedSize);
++    InvalidateIntervalInternal(Invalidate->Offset, Invalidate->End - Invalidate->Offset);
+   }
+ }
+ 
+@@ -189,6 +210,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
+     std::unique_lock Lock(IntervalsLock);
+     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
+     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
++    RemoveFreedHostPages(SectionBase, SectionSize);
+   }
+ 
+   return {SectionBase, SectionSize};
+@@ -209,6 +231,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
+     std::unique_lock Lock(IntervalsLock);
+     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
++    RemoveFreedHostPages(AlignedBase, AlignedSize);
+   }
+ }
+ 
+@@ -217,26 +240,37 @@ void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size)
+ }
+ 
+ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress) {
+-  const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
++  const bool NeedsInvalidate = [&](uint64_t Address) {
+     std::shared_lock Lock(IntervalsLock);
+-    if (!RWXIntervals.Query(Address).Enclosed) {
+-      return {false, 0};
+-    }
+-    return {true, GetUntrapProt(Address)};
++    return RWXIntervals.Query(Address).Enclosed;
+   }(FaultAddress);
+ 
+   if (NeedsInvalidate) {
++    // Unprotecting the faulting page makes its whole host page writable, so the host page must be invalidated and untrapped together.
++    const auto HostInterval = HostPageInterval(FaultAddress, 1);
++
++    bool HasCode = true;
++    if (HostPageMask != FEXCore::Utils::FEX_PAGE_MASK) {
++      std::scoped_lock Lock(CodePagesLock);
++      HasCode = CodePages.Query(FaultAddress).Enclosed;
++      CodePages.Remove(HostInterval);
++    }
++
+     // IntervalsLock cannot be held during invalidation
+     {
+       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+ 
+-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
++      InvalidateIntervalInternalLocked(HostInterval.Offset, HostInterval.End - HostInterval.Offset);
+ 
+-      // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
+-      ULONG TmpProt;
+-      void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
+-      SIZE_T TmpSize = 1;
+-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
++      // Invalidate, then unprotect the faulting host page with the compilation lock held to ensure that any racing invalidations are not dropped.
++      std::unique_lock IntervalsUniqueLock(IntervalsLock);
++      if (!HasCode) {
++        // The write doesn't modify compiled code and only faulted as its page shares a host page with trapped code, which would
++        // repeat on every such write, so validate code from the host page before execution instead of trapping it.
++        LogMan::Msg::DFmt("Add full SMC detection interval: {:X} - {:X}", HostInterval.Offset, HostInterval.End);
++        FullSMCDetectionIntervals.Insert(HostInterval);
++      }
++      SetRWXIntervalsProtection(HostInterval.Offset, HostInterval.End, true);
+     }
+     DetectMonoBackpatcherBlock(Thread, HostPc);
+     return true;
+@@ -255,12 +289,23 @@ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint
+     return {};
+   }
+   const auto RWXResult = RWXIntervals.Query(Address);
++  FEXCore::HLE::ExecutableRangeInfo Result;
+   if (RWXResult.Enclosed) {
+-    return {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
++    Result = {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
+   } else if (RWXResult.Size && RWXResult.Size < XResult.Size) {
+-    return {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
++    Result = {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
++  } else {
++    Result = {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
++  }
++
++  // Split the range at the bounds of host pages requiring full SMC detection
++  const uint64_t End = Result.Base + Result.Size;
++  if (FullSMCDetectionIntervals.Intersect({Result.Base, End})) {
++    const auto FullSMCResult = FullSMCDetectionIntervals.Query(Address);
++    const uint64_t SplitEnd = FullSMCResult.Size ? std::min(End, Address + FullSMCResult.Size) : End;
++    Result = {Address, SplitEnd - Address, Result.Writable, FullSMCResult.Enclosed};
+   }
+-  return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
++  return Result;
+ }
+ 
+ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc) {
+@@ -339,31 +384,51 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
+ }
+ 
+ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
+-  const auto End = Address + Size;
++  // Writes to a host page only fault once none of its pages are writable, and untrapping a page makes its whole host page
++  // writable, so trap and untrap whole host pages.
++  const auto HostInterval = HostPageInterval(Address, Size);
+   std::shared_lock Lock(IntervalsLock);
+ 
+-  if (SMCDetectionDisabled) {
++  if (SMCDetectionDisabled || !RWXIntervals.Intersect(HostInterval)) {
+     return false;
+   }
+ 
+-  bool HitRWXInterval = false;
++  if (ForWriteLocked) {
++    // If we are protecting as writable, then the entire range must be invalidated before any protections are
++    // applied and the invalidation mutex must be locked throughout.
++    // NOTE: This assumes CodeInvalidationMutex is locked by the caller
++    InvalidateIntervalInternalLocked(HostInterval.Offset, HostInterval.End - HostInterval.Offset);
++    SetRWXIntervalsProtection(HostInterval.Offset, HostInterval.End, true);
++    return true;
++  }
++
++  if (HostPageMask != FEXCore::Utils::FEX_PAGE_MASK) {
++    // Remember the pages code was compiled from, to tell writes modifying it apart from writes to other pages sharing their host pages
++    std::scoped_lock CodePagesLockGuard(CodePagesLock);
++    CodePages.Insert(
++      {Address & FEXCore::Utils::FEX_PAGE_MASK, (Address + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK});
++  }
++
++  // Host pages requiring full SMC detection are left untrapped
++  for (uint64_t Start = HostInterval.Offset; Start < HostInterval.End;) {
++    const auto Query = FullSMCDetectionIntervals.Query(Start);
++    const uint64_t End = Query.Size ? std::min(HostInterval.End, Start + Query.Size) : HostInterval.End;
++    if (!Query.Enclosed) {
++      SetRWXIntervalsProtection(Start, End, false);
++    }
++    Start = End;
++  }
++  return true;
++}
++
++void InvalidationTracker::SetRWXIntervalsProtection(uint64_t Address, uint64_t End, bool Untrap) {
+   do {
+     const auto Query = RWXIntervals.Query(Address);
+     if (Query.Enclosed) {
+-      if (!HitRWXInterval) {
+-        if (ForWriteLocked) {
+-          // If we are protecting as writable, then the entire range must be invalidated before any protections are
+-          // applied and the invalidation mutex must be locked throughout.
+-          // Do this lazily only when an RWX region is actually hit.
+-          // NOTE: This assumes CodeInvalidationMutex is locked by the caller
+-          InvalidateIntervalInternalLocked(Address, Size);
+-        }
+-        HitRWXInterval = true;
+-      }
+       void* TmpAddress = reinterpret_cast<void*>(Address);
+       SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
+       ULONG TmpProt;
+-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address), &TmpProt);
++      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, Untrap ? GetUntrapProt(Address) : GetTrapProt(Address), &TmpProt);
+     } else if (!Query.Size) {
+       // No more regions past `Address` in the interval list
+       break;
+@@ -371,8 +436,45 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+ 
+     Address += Query.Size;
+   } while (Address < End);
++}
++
++bool InvalidationTracker::HasUntrackedWritablePages(FEXCore::IntervalList<uint64_t>::Interval Interval) const {
++  for (uint64_t Address = Interval.Offset; Address < Interval.End;) {
++    MEMORY_BASIC_INFORMATION Info;
++    if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
++      break;
++    }
++
++    const uint64_t RegionEnd = std::min(Interval.End, reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize);
++    if (Info.State == MEM_COMMIT && ProtIsWritable(Info.Protect)) {
++      while (Address < RegionEnd) {
++        const auto Query = RWXIntervals.Query(Address);
++        if (!Query.Enclosed) {
++          return true;
++        }
++        Address += Query.Size;
++      }
++    }
++    Address = RegionEnd;
++  }
++  return false;
++}
++
++void InvalidationTracker::RemoveFreedHostPages(uint64_t Address, uint64_t Size) {
++  if (HostPageMask == FEXCore::Utils::FEX_PAGE_MASK) {
++    return;
++  }
++
++  // Only host pages entirely within the freed range stop sharing a host page with other memory
++  const uint64_t Start = (Address + ~HostPageMask) & HostPageMask;
++  const uint64_t End = (Address + Size) & HostPageMask;
++  if (Start >= End) {
++    return;
++  }
+ 
+-  return HitRWXInterval;
++  FullSMCDetectionIntervals.Remove({Start, End});
++  std::scoped_lock Lock(CodePagesLock);
++  CodePages.Remove({Start, End});
+ }
+ 
+ } // namespace FEX::Windows
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index d2a80bcaa..18a3a4e29 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -33,8 +33,16 @@ public:
+   InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
+   void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
+   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
++  // Invalidates and untraps the whole host page containing FaultAddress if it is within an RWX interval.
+   bool HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t FaultAddress);
+ 
++  // Returns the range extended to whole host pages.
++  // The host can only protect whole host pages, which may be larger than FEX_PAGE_SIZE, so the protection of a page applies to every page
++  // sharing its host page.
++  FEXCore::IntervalList<uint64_t>::Interval HostPageInterval(uint64_t Address, uint64_t Size) const {
++    return {Address & HostPageMask, (Address + Size + ~HostPageMask) & HostPageMask};
++  }
++
+   // Unprotects any RWX intervals in the input interval and invalidates code
+   // NOTE: CodeInvalidationMutex must be locked when calling this, and if true is returned, kept locked until the write ends.
+   bool BeginUntrackedWriteLocked(uint64_t Address, uint64_t Size);
+@@ -50,8 +58,21 @@ private:
+ 
+   // NOTE: If ForWriteLocked is true then this assumes CodeInvalidationMutex is locked by the caller,
+   // and any code in the range will be invalidated before protection as RWX, otherwise protects as RX if false.
++  // The range is extended to whole host pages.
+   bool ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked);
+ 
++  // Untraps (restoring write) or traps (removing write) the RWX intervals within [Address, End).
++  // NOTE: Must be called with IntervalsLock held.
++  void SetRWXIntervalsProtection(uint64_t Address, uint64_t End, bool Untrap);
++
++  // Returns true if the interval contains committed writable pages outside of RWX intervals.
++  // NOTE: Must be called with IntervalsLock held.
++  bool HasUntrackedWritablePages(FEXCore::IntervalList<uint64_t>::Interval Interval) const;
++
++  // Stops tracking the host pages entirely within a freed range.
++  // NOTE: Must be called with IntervalsLock held exclusively.
++  void RemoveFreedHostPages(uint64_t Address, uint64_t Size);
++
+   // Returns the correct protection for trapping (removing write) or untrapping (restoring write) an RWX interval.
+   // For DEP-promoted regions (originally non-exec), uses PAGE_READONLY/PAGE_READWRITE instead of PAGE_EXECUTE_READ/PAGE_EXECUTE_READWRITE.
+   // NOTE: Must be called with IntervalsLock held.
+@@ -63,10 +84,20 @@ private:
+   std::shared_mutex IntervalsLock;
+   FEXCore::Context::Context& CTX;
+   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;
++  const uint64_t HostPageMask;
+   bool SMCDetectionDisabled {false};                    // Protected by IntervalsLock
+   bool DEPDisabled {false};                             // Protected by IntervalsLock
+   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+ 
++  // Host pages that can't be write protected without trapping writes to pages other than the compiled code they contain,
++  // when host pages are larger than FEX_PAGE_SIZE. Code from them is validated before execution instead.
++  FEXCore::IntervalList<uint64_t> FullSMCDetectionIntervals; // Protected by IntervalsLock
++
++  // Pages trapped for containing compiled code, when host pages are larger than FEX_PAGE_SIZE.
++  // NOTE: If taken together with IntervalsLock, CodePagesLock must be taken last.
++  std::mutex CodePagesLock;
++  FEXCore::IntervalList<uint64_t> CodePages; // Protected by CodePagesLock
++
+   bool MonoBackpatcherDetectionPending {false};
+   uint64_t MonoBase {0};
+   uint64_t MonoEnd {0};
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.cpp b/Source/Windows/UnixLib/FEXUnixLib.cpp
+index 8adef5993..f87addf48 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.cpp
++++ b/Source/Windows/UnixLib/FEXUnixLib.cpp
+@@ -181,6 +181,12 @@ static NTSTATUS FEXUnixLib_GetPIDHandler(void* _Args) {
+   Args->Result = ::getpid();
+   return STATUS_SUCCESS;
+ }
++
++static NTSTATUS FEXUnixLib_GetHostPageSizeHandler(void* _Args) {
++  auto Args = reinterpret_cast<FEXUnixLib_GetHostPageSize*>(_Args);
++  Args->Result = ::sysconf(_SC_PAGESIZE);
++  return STATUS_SUCCESS;
++}
+ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
+   FEXUnixLib_SetHardwareTSOControlHandler,
+   FEXUnixLib_SetKernelUnalignedAtomicControlHandler,
+@@ -190,6 +196,7 @@ extern "C" const unixlib_entry_t __wine_unix_call_funcs[] = {
+   FEXUnixLib_DeleteSHMStatsFileHandler,
+   FEXUnixLib_MapFileHandler,
+   FEXUnixLib_GetPIDHandler,
++  FEXUnixLib_GetHostPageSizeHandler,
+ };
+ 
+ static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == ToUnderlying(FEXUnixLibFunctions::MAX));
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.h b/Source/Windows/UnixLib/FEXUnixLib.h
+index ed7f18ce6..e9f8bb64d 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.h
++++ b/Source/Windows/UnixLib/FEXUnixLib.h
+@@ -12,6 +12,7 @@ enum class FEXUnixLibFunctions : uint32_t {
+   DeleteSHMStatsFile,
+   MapFile,
+   GetPID,
++  GetHostPageSize,
+   MAX,
+ };
+ 
+@@ -65,3 +66,8 @@ struct FEXUnixLib_GetPID {
+   uint32_t Result;
+ };
+ static_assert(sizeof(FEXUnixLib_GetPID) == 4);
++
++struct FEXUnixLib_GetHostPageSize {
++  uint64_t Result;
++};
++static_assert(sizeof(FEXUnixLib_GetHostPageSize) == 8);
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 8c6b7f76e..ffac9930b 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -751,8 +751,10 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+       std::scoped_lock Lock(ThreadCreationMutex);
+       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
+       if (InvalidationTracker->HandleRWXAccessViolation(Thread, Context->Pc, FaultAddress)) {
++        // The whole host page containing the fault is now writable, so further writes to it from the current block will not fault.
++        const auto WritableInterval = InvalidationTracker->HostPageInterval(FaultAddress, 1);
+         if (CTX->IsAddressInCodeBuffer(Thread, Context->Pc) && !CTX->IsCurrentBlockSingleInst(Thread) &&
+-            CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
++            CTX->IsAddressInCurrentBlock(Thread, WritableInterval.Offset, WritableInterval.End - WritableInterval.Offset)) {
+           Context::ReconstructThreadState(Context);
+           LogMan::Msg::DFmt("Handled inline self-modifying code: pc: {:X} rip: {:X} fault: {:X}", Context->Pc,
+                             Thread->CurrentFrame->State.rip, FaultAddress);
+-- 
+2.56.0
+

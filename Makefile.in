@@ -1373,7 +1373,9 @@ FEX_UNIXLIB_aarch64_CMAKE_ARGS = -DCMAKE_INSTALL_LIBDIR=$(FEX_UNIXLIB_aarch64_DS
 $(eval $(call rules-source,fex_unixlib,$(SRCDIR)/FEX/Source/Windows/UnixLib))
 $(eval $(call rules-cmake,fex_unixlib,aarch64,unix))
 
-$(OBJ)/.fex_unixlib-post-source:
+# the unix library must be built from the same, patched, sources as the PE modules
+$(OBJ)/.fex_unixlib-post-source: $(OBJ)/.fex-post-source
+	rsync -a "$(FEX_SRC)/Source/Windows/UnixLib/" "$(FEX_UNIXLIB_SRC)/"
 	git -C $(SRCDIR)/FEX describe --abbrev=7 > $(FEX_UNIXLIB_SRC)/.git_describe
 	git -C $(SRCDIR)/FEX rev-parse --short=7 HEAD > $(FEX_UNIXLIB_SRC)/.git_rev
 	touch $@
