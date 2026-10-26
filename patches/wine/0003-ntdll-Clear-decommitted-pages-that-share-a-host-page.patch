@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Mon, 26 Oct 2026 14:32:03 -0700
+Subject: [PATCH] ntdll: Clear decommitted pages that share a host page with
+ other pages.
+
+When the host page size is larger than the page size, decommit_pages() only unmaps the host pages fully within the range, so partially covered host pages keep the contents of the decommitted pages and committing them again returns stale data instead of zeroes as on Windows, which breaks applications relying on it such as V8. Clear the decommitted part of those host pages, temporarily making them writable if needed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/virtual.c | 34 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index fa2b37db769..0a8c20d1b80 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2680,6 +2680,30 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
+ }
+ 
+ 
++/***********************************************************************
++ *           clear_decommitted_pages
++ *
++ * Clear decommitted pages that lie within a single host page, which stays mapped
++ * because it can still contain committed pages, so that they read as zero when
++ * they are committed again.
++ * virtual_mutex must be held by caller.
++ */
++static void clear_decommitted_pages( char *base, size_t size )
++{
++    char *host_page = ROUND_ADDR( base, host_page_mask );
++    int prot = get_unix_prot( get_host_page_vprot( host_page ) );
++
++    if (!(prot & PROT_WRITE) && mprotect( host_page, host_page_size, prot | PROT_READ | PROT_WRITE ) &&
++        mprotect( host_page, host_page_size, PROT_READ | PROT_WRITE ))
++    {
++        ERR( "failed to clear decommitted pages %p-%p\n", base, base + size - 1 );
++        return;
++    }
++    memset( base, 0, size );
++    mprotect_range( host_page, host_page_size, 0, 0 );
++}
++
++
+ /***********************************************************************
+  *           decommit_pages
+  *
+@@ -2688,7 +2712,7 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, size_t max
+  */
+ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
+ {
+-    char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
++    char *end, *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
+ 
+     if (!size)
+     {
+@@ -2696,10 +2720,18 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size
+         host_end = host_start + view->size;
+     }
+     else host_end = ROUND_ADDR( base + size, host_page_mask );
++    end = base + size;
+ 
+     if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
+     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
+     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
++
++    if (host_start > host_end) clear_decommitted_pages( base, size );
++    else
++    {
++        if (base < host_start) clear_decommitted_pages( base, host_start - base );
++        if (host_end < end) clear_decommitted_pages( host_end, end - host_end );
++    }
+     return STATUS_SUCCESS;
+ }
+ 
+-- 
+2.56.0
+
