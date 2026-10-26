@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Mon, 26 Oct 2026 16:36:59 -0700
+Subject: [PATCH] ntdll: Only discard whole host pages for MEM_RESET.
+
+madvise() rounds the length up to the host page size, so on hosts with pages larger than the page size MEM_RESET discarded the rest of the last host page and, unless the range started on a host page boundary, failed without discarding anything. Data following the range was lost, e.g. V8 heap objects next to memory Chromium discarded with DiscardVirtualMemory(), crashing its garbage collector. Only discard the host pages entirely within the range, as resetting is only a hint that the contents of the range may be discarded.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/virtual.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 0a8c20d1b80..b2a3c049e64 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5536,7 +5536,14 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
+     else if (type & MEM_RESET)
+     {
+         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
+-        else madvise( base, size, MADV_DONTNEED );
++        else
++        {
++            /* only whole host pages can be discarded, partially covered ones keep their contents */
++            char *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
++            char *host_end = ROUND_ADDR( (char *)base + size, host_page_mask );
++
++            if (host_start < host_end) madvise( host_start, host_end - host_start, MADV_DONTNEED );
++        }
+     }
+     else  /* commit the pages */
+     {
+-- 
+2.56.0
+
