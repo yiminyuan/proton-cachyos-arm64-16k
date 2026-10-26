@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Sun, 25 Oct 2026 22:50:15 -0700
+Subject: [PATCH] ntdll: Handle system threads in the ARM64 quit and suspend
+ signal handlers.
+
+System threads have a TEB but no syscall frame, so on ARM64 the SIGQUIT sent when the process exits made quit_handler() pass a NULL frame to user_mode_abort_thread(), faulting on the signal stack and dispatching the fault as a user exception into PE code that never ran on the thread, which crashes WoW64 processes on exit. Special-case them like the x86_64 and i386 handlers already do.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/signal_arm64.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index d379d2754da..463f80a130b 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -1350,7 +1350,8 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     ucontext_t *context = sigcontext;
+ 
+-    if (!is_inside_syscall( SP_sig(context) )) user_mode_abort_thread( 0, get_syscall_frame() );
++    if (!ntdll_get_thread_data()->system_thread && !is_inside_syscall( SP_sig(context) ))
++        user_mode_abort_thread( 0, get_syscall_frame() );
+     abort_thread(0);
+ }
+ 
+@@ -1396,6 +1397,12 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     extern const ULONG_PTR __wine_unix_call_dispatcher_kernel_stack_ptr;
+     extern const ULONG_PTR __wine_unix_call_dispatcher_user_stack;
+ 
++    if (ntdll_get_thread_data()->system_thread)
++    {
++        server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
++        return;
++    }
++
+     /* if we're in a syscall dispatcher, but not yet on the syscall stack, construct
+      * the frame now from the signal context. */
+     if ((ULONG_PTR)__wine_syscall_dispatcher <= PC_sig(sigcontext) &&
+-- 
+2.56.0
+
