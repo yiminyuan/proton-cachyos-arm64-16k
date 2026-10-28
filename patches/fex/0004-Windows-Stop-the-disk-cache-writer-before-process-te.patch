@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Tue, 27 Oct 2026 23:09:35 -0700
+Subject: [PATCH 4/4] Windows: Stop the disk cache writer before process
+ termination
+
+When a Windows process exits, every other thread is terminated wherever it is before DLL detach routines run on the exiting thread, which can still need to compile code. If the disk cache's writer thread was terminated while holding its work queue lock, as observed with DXSETUP's infinst.exe, or the disk cache index lock, compiling then deadlocked queuing the store or looking up the cache. Stop the writer from the process termination callbacks before the other threads are terminated, waiting for pending stores and discarding any queued afterwards.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Context/Context.h      | 3 +++
+ FEXCore/Source/Interface/Core/DiskCache.h       | 7 +++++++
+ FEXCore/Source/Utils/WorkQueueThread.cpp        | 7 +++++++
+ FEXCore/include/FEXCore/Core/Context.h          | 2 ++
+ FEXCore/include/FEXCore/Utils/WorkQueueThread.h | 3 +++
+ Source/Windows/ARM64EC/Module.cpp               | 8 +++++++-
+ Source/Windows/WOW64/Module.cpp                 | 8 +++++++-
+ 7 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 9f427da20..0521434c7 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -206,6 +206,9 @@ public:
+   FEXCore::CPUID::FunctionResults RunCPUIDFunctionName(uint32_t Function, uint32_t Leaf, uint32_t CPU) override;
+ 
+   virtual void InitDiskCache() override {}
++  void StopDiskCacheWriter() override {
++    DiskCache.StopWriter();
++  }
+ 
+   CodeCache& GetCodeCache() override {
+     return CodeCache;
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index 33321b1f4..d352c15c4 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -205,6 +205,13 @@ namespace DiskCache {
+     bool IsReadingDiskCache() const {
+       return ReadingDiskCache;
+     }
++
++    // Waits for pending stores to be written and stops the writer thread, later stores are dropped.
++    void StopWriter() {
++      if (Writer) {
++        Writer->Shutdown();
++      }
++    }
+     bool IsValidating() const {
+       return Validation;
+     }
+diff --git a/FEXCore/Source/Utils/WorkQueueThread.cpp b/FEXCore/Source/Utils/WorkQueueThread.cpp
+index aba640818..8d6955a2e 100644
+--- a/FEXCore/Source/Utils/WorkQueueThread.cpp
++++ b/FEXCore/Source/Utils/WorkQueueThread.cpp
+@@ -9,6 +9,10 @@ WorkQueueThread::WorkQueueThread(FEXCore::Threads::Flags ThreadFlags, const char
+ }
+ 
+ WorkQueueThread::~WorkQueueThread() {
++  Shutdown();
++}
++
++void WorkQueueThread::Shutdown() {
+   {
+     std::unique_lock lk {Mutex};
+     Stop = true;
+@@ -23,6 +27,9 @@ WorkQueueThread::~WorkQueueThread() {
+ void WorkQueueThread::QueueWork(fextl::unique_ptr<WorkItem> Work) {
+   {
+     std::unique_lock lk {Mutex};
++    if (Stop) {
++      return;
++    }
+     Queue.push_back(std::move(Work));
+   }
+   CV.notify_one();
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 8aa448e2e..005d21c63 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -134,6 +134,8 @@ public:
+   FEX_DEFAULT_VISIBILITY virtual FEXCore::CPUID::FunctionResults RunCPUIDFunctionName(uint32_t Function, uint32_t Leaf, uint32_t CPU) = 0;
+ 
+   virtual void InitDiskCache() = 0;
++  // Stops the disk cache's writer thread, for when other threads are about to be terminated at an arbitrary point.
++  virtual void StopDiskCacheWriter() = 0;
+ 
+   virtual AbstractCodeCache& GetCodeCache() = 0;
+   virtual void SetCodeMapWriter(fextl::unique_ptr<CodeMapWriter>) = 0;
+diff --git a/FEXCore/include/FEXCore/Utils/WorkQueueThread.h b/FEXCore/include/FEXCore/Utils/WorkQueueThread.h
+index 49a6da531..8e8a827f5 100644
+--- a/FEXCore/include/FEXCore/Utils/WorkQueueThread.h
++++ b/FEXCore/include/FEXCore/Utils/WorkQueueThread.h
+@@ -23,6 +23,9 @@ public:
+ 
+   void QueueWork(fextl::unique_ptr<WorkItem> Work);
+ 
++  // Waits for the queued work to finish and stops the thread, work queued afterwards is discarded.
++  void Shutdown();
++
+ private:
+   // static function for the ::Thread to refer to
+   static void* ThreadEntry(void* Self) {
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 6c97bbb41..8b34adb1c 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -735,7 +735,13 @@ NTSTATUS ProcessInit() {
+   return STATUS_SUCCESS;
+ }
+ 
+-void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
++void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
++  if (!Handle && !After && CTX) {
++    // All other threads are about to be terminated wherever they are, including internal ones whose locks the code still
++    // running during process shutdown may need, so stop those first.
++    CTX->StopDiskCacheWriter();
++  }
++}
+ 
+ // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
+ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index ffac9930b..3c405a7cd 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -577,7 +577,13 @@ void BTCpuProcessInit() {
+   }
+ }
+ 
+-void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {}
++void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {
++  if (!Handle && !After && CTX) {
++    // All other threads are about to be terminated wherever they are, including internal ones whose locks the code still
++    // running during process shutdown may need, so stop those first.
++    CTX->StopDiskCacheWriter();
++  }
++}
+ 
+ void BTCpuThreadInit() {
+   static constexpr size_t DefaultWow64CS {4};
+-- 
+2.56.0
+
