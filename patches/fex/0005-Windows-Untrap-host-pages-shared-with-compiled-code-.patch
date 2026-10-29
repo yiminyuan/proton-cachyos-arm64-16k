@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Wed, 28 Oct 2026 22:33:09 -0700
+Subject: [PATCH] Windows: Untrap host pages shared with compiled code before
+ file reads
+
+On hosts with pages larger than 4KiB, RWX intervals are trapped at host page granularity, so a file read into a page that only shares its host page with compiled code failed with STATUS_ACCESS_VIOLATION, as reads into trapped pages can't be handled when the kernel faults writing to them. Before a file read, switch such host pages to full SMC detection and untrap them as is done when a guest write to them faults, leaving reads into the pages code was compiled from as they are with 4KiB host pages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/ARM64EC/Module.cpp             |  5 +-
+ Source/Windows/Common/InvalidationTracker.cpp | 62 ++++++++++++++-----
+ Source/Windows/Common/InvalidationTracker.h   |  7 +++
+ Source/Windows/WOW64/Module.cpp               |  5 +-
+ 4 files changed, 61 insertions(+), 18 deletions(-)
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 8b34adb1c..082512742 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1010,7 +1010,10 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
+     return;
+   }
+ 
+-  if (After && Status == STATUS_SUCCESS) {
++  if (!After) {
++    std::scoped_lock Lock(ThreadCreationMutex);
++    InvalidationTracker->PrepareUntrackedWrite(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size));
++  } else if (Status == STATUS_SUCCESS) {
+     std::scoped_lock Lock(ThreadCreationMutex);
+     InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+   }
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 5460579fa..6f7cb7623 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -272,22 +272,9 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+       CodePages.Remove(HostInterval);
+     }
+ 
+-    // IntervalsLock cannot be held during invalidation
+-    {
+-      std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+-
+-      InvalidateIntervalInternalLocked(HostInterval.Offset, HostInterval.End - HostInterval.Offset);
+-
+-      // Invalidate, then unprotect the faulting host page with the compilation lock held to ensure that any racing invalidations are not dropped.
+-      std::unique_lock IntervalsUniqueLock(IntervalsLock);
+-      if (!HasCode) {
+-        // The write doesn't modify compiled code and only faulted as its page shares a host page with trapped code, which would
+-        // repeat on every such write, so validate code from the host page before execution instead of trapping it.
+-        LogMan::Msg::DFmt("Add full SMC detection interval: {:X} - {:X}", HostInterval.Offset, HostInterval.End);
+-        FullSMCDetectionIntervals.Insert(HostInterval);
+-      }
+-      SetRWXIntervalsProtection(HostInterval.Offset, HostInterval.End, true);
+-    }
++    // If the write doesn't modify compiled code and only faulted as its page shares a host page with trapped code, which would
++    // repeat on every such write, validate code from the host page before execution instead of trapping it.
++    UntrapHostPage(HostInterval, !HasCode);
+     DetectMonoBackpatcherBlock(Thread, HostPc);
+     return true;
+   }
+@@ -298,6 +285,34 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
+   return ProtectRWXIntervalsInternal(Address, Size, true);
+ }
+ 
++void InvalidationTracker::PrepareUntrackedWrite(uint64_t Address, uint64_t Size) {
++  if (HostPageMask == FEXCore::Utils::FEX_PAGE_MASK || !Size) {
++    return;
++  }
++
++  const auto HostInterval = HostPageInterval(Address, Size);
++  for (uint64_t Page = HostInterval.Offset; Page < HostInterval.End; Page += ~HostPageMask + 1) {
++    const FEXCore::IntervalList<uint64_t>::Interval PageInterval {Page, Page + ~HostPageMask + 1};
++    {
++      std::shared_lock Lock(IntervalsLock);
++      if (SMCDetectionDisabled || !RWXIntervals.Intersect(PageInterval) || FullSMCDetectionIntervals.Intersect(PageInterval)) {
++        continue;
++      }
++    }
++
++    // Writes to the pages code was compiled from still fault, as with host pages of FEX_PAGE_SIZE
++    const FEXCore::IntervalList<uint64_t>::Interval WriteInterval {std::max(Address, Page), std::min(Address + Size, PageInterval.End)};
++    {
++      std::scoped_lock Lock(CodePagesLock);
++      if (!CodePages.Intersect(PageInterval) || CodePages.Intersect(WriteInterval)) {
++        continue;
++      }
++      CodePages.Remove(PageInterval);
++    }
++    UntrapHostPage(PageInterval, true);
++  }
++}
++
+ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
+   std::shared_lock Lock(IntervalsLock);
+   const auto XResult = XIntervals.Query(Address);
+@@ -437,6 +452,21 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+   return true;
+ }
+ 
++void InvalidationTracker::UntrapHostPage(FEXCore::IntervalList<uint64_t>::Interval HostInterval, bool FullSMCDetection) {
++  // IntervalsLock cannot be held during invalidation
++  std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
++
++  InvalidateIntervalInternalLocked(HostInterval.Offset, HostInterval.End - HostInterval.Offset);
++
++  // Invalidate, then unprotect the host page with the compilation lock held to ensure that any racing invalidations are not dropped.
++  std::unique_lock IntervalsUniqueLock(IntervalsLock);
++  if (FullSMCDetection) {
++    LogMan::Msg::DFmt("Add full SMC detection interval: {:X} - {:X}", HostInterval.Offset, HostInterval.End);
++    FullSMCDetectionIntervals.Insert(HostInterval);
++  }
++  SetRWXIntervalsProtection(HostInterval.Offset, HostInterval.End, true);
++}
++
+ void InvalidationTracker::SetRWXIntervalsProtection(uint64_t Address, uint64_t End, bool Untrap) {
+   do {
+     const auto Query = RWXIntervals.Query(Address);
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index 34d9461ec..c916fa457 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -47,6 +47,10 @@ public:
+   // NOTE: CodeInvalidationMutex must be locked when calling this, and if true is returned, kept locked until the write ends.
+   bool BeginUntrackedWriteLocked(uint64_t Address, uint64_t Size);
+ 
++  // Untraps the host pages a write that can't be handled when faulting, such as a file read, would otherwise fault on only
++  // because they are shared with compiled code, switching them to full SMC detection.
++  void PrepareUntrackedWrite(uint64_t Address, uint64_t Size);
++
+   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
+ 
+ private:
+@@ -61,6 +65,9 @@ private:
+   // The range is extended to whole host pages.
+   bool ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked);
+ 
++  // Invalidates and untraps the host page, switching it to full SMC detection if requested.
++  void UntrapHostPage(FEXCore::IntervalList<uint64_t>::Interval HostInterval, bool FullSMCDetection);
++
+   // Untraps (restoring write) or traps (removing write) the RWX intervals within [Address, End).
+   // NOTE: Must be called with IntervalsLock held.
+   void SetRWXIntervalsProtection(uint64_t Address, uint64_t End, bool Untrap);
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 3c405a7cd..34687df0c 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -893,7 +893,10 @@ void BTCpuNotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After,
+   }
+ 
+   // See arm64ec `BTCpu64NotifyReadFile` for why this like this.
+-  if (After && Status == STATUS_SUCCESS) {
++  if (!After) {
++    std::scoped_lock Lock(ThreadCreationMutex);
++    InvalidationTracker->PrepareUntrackedWrite(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size));
++  } else if (Status == STATUS_SUCCESS) {
+     std::scoped_lock Lock(ThreadCreationMutex);
+     InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+   }
+-- 
+2.56.0
+
