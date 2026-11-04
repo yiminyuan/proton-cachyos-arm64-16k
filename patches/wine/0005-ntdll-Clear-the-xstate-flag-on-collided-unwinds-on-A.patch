@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Tue, 3 Nov 2026 22:19:19 -0800
+Subject: [PATCH] ntdll: Clear the xstate flag on collided unwinds on ARM64EC.
+
+A language handler reporting a collided unwind can leave CONTEXT_XSTATE set in the dispatcher's context record, as CoreCLR does when restoring a saved thread context, but that context is a plain CONTEXT without a CONTEXT_EX behind it. context_x64_to_arm() then followed a garbage extended context: in RtlUnwindEx() the resulting access violation in NtContinue() on a consolidated unwind was unwound and raised again until the thread ran out of stack, hanging .NET applications like the Baldur's Gate 3 launcher. Clear the flag as is done on x86-64, also on the dispatch side, which starts by clearing it too and where RtlVirtualUnwind2() converts the context for EC frames.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/signal_arm64ec.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 712d7f41779..89e21e81715 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -1095,6 +1095,7 @@ EXCEPTION_DISPOSITION WINAPI unwind_exception_handler( EXCEPTION_RECORD *record,
+     dispatch->ScopeIndex         = orig_dispatch->ScopeIndex;
+     dispatch->ControlPcIsUnwound = orig_dispatch->ControlPcIsUnwound;
+     *dispatch->ContextRecord     = *orig_dispatch->ContextRecord;
++    dispatch->ContextRecord->ContextFlags &= ~0x40;
+     memcpy( dispatch->NonVolatileRegisters, orig_dispatch->NonVolatileRegisters,
+             sizeof(DISPATCHER_CONTEXT_NONVOLREG_ARM64) );
+     TRACE( "detected collided unwind\n" );
+@@ -1222,6 +1223,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+                 TRACE( "nested exception\n" );
+                 break;
+             case ExceptionCollidedUnwind:
++                context.ContextFlags &= ~0x40; /* clear xstate flag */
+                 RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase,
+                                   dispatch.ControlPc, dispatch.FunctionEntry,
+                                   &context.AMD64_Context, &dispatch.HandlerData, &frame, NULL );
+@@ -1251,6 +1253,7 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+                 TRACE( "nested exception\n" );
+                 break;
+             case ExceptionCollidedUnwind:
++                context.ContextFlags &= ~0x40; /* clear xstate flag */
+                 RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase,
+                                   dispatch.ControlPc, dispatch.FunctionEntry,
+                                   &context.AMD64_Context, &dispatch.HandlerData, &frame, NULL );
+@@ -1730,6 +1733,7 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
+                 rec->ExceptionFlags &= ~EXCEPTION_COLLIDED_UNWIND;
+                 break;
+             case ExceptionCollidedUnwind:
++                context->ContextFlags &= ~0x40; /* clear xstate flag */
+                 new_context.AMD64_Context = *context;
+                 RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase, dispatch.ControlPc,
+                                   dispatch.FunctionEntry, &new_context.AMD64_Context,
+@@ -1760,6 +1764,7 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
+                     rec->ExceptionFlags &= ~EXCEPTION_COLLIDED_UNWIND;
+                     break;
+                 case ExceptionCollidedUnwind:
++                    context->ContextFlags &= ~0x40; /* clear xstate flag */
+                     new_context.AMD64_Context = *context;
+                     RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase, dispatch.ControlPc,
+                                       dispatch.FunctionEntry, &new_context.AMD64_Context,
+-- 
+2.56.0
+
