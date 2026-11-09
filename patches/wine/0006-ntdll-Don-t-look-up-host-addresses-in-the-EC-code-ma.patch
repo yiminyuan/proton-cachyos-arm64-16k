@@ -1,0 +1,57 @@
+From 316b949ecb39685698bd2d47b94e4c6f2c88e6ad Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Sun, 8 Nov 2026 23:16:39 -0800
+Subject: [PATCH] ntdll: Don't look up host addresses in the EC code map in
+ RtlIsEcCode.
+
+The EC code map only covers the user address space, but exceptions raised by Unix libraries, such as EXCEPTION_WINE_ASSERTION from an abort() in a Vulkan layer, are dispatched with the program counter in host code, which on 48-bit address space hosts lies far above the end of the map, so RtlIsEcCode() faulted while unwinding the first frame and the thread looped on access violations forever instead of the exception being dispatched; report addresses above the highest user address as not EC code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/signal_arm64ec.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 89e21e81715..2ee69c5d7af 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -65,6 +65,7 @@ static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
+ 
+ static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+ static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
++static ULONG_PTR highest_user_address = ~(ULONG_PTR)0; /* set at process init */
+ extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispatcher");
+ 
+ static inline CHPE_V2_CPU_AREA_INFO *get_arm64ec_cpu_area(void)
+@@ -196,6 +197,7 @@ NTSTATUS arm64ec_process_init( HMODULE module )
+     NTSTATUS status = STATUS_SUCCESS;
+     CHPEV2_PROCESS_INFO *info = (CHPEV2_PROCESS_INFO *)(RtlGetCurrentPeb() + 1);
+     const IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( module );
++    SYSTEM_BASIC_INFORMATION sbi;
+ 
+     __os_arm64x_dispatch_call_no_redirect = RtlFindExportedRoutineByName( module, "ExitToX64" );
+     __os_arm64x_dispatch_fptr = RtlFindExportedRoutineByName( module, "DispatchJump" );
+@@ -227,6 +229,9 @@ NTSTATUS arm64ec_process_init( HMODULE module )
+     info->EmulatedMachineType = IMAGE_FILE_MACHINE_AMD64;
+     memcpy( KiUserExceptionDispatcher_orig, KiUserExceptionDispatcher_thunk, sizeof(KiUserExceptionDispatcher_orig) );
+ 
++    if (!NtQuerySystemInformation( SystemBasicInformation, &sbi, sizeof(sbi), NULL ))
++        highest_user_address = (ULONG_PTR)sbi.HighestUserAddress;
++
+     enter_syscall_callback();
+     if (pProcessInit) status = pProcessInit();
+     if (!status)
+@@ -1415,6 +1420,10 @@ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
+ {
+     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
+     ULONG_PTR page = ptr / page_size;
++
++    /* the code map only covers the user address space, but host code can show up
++     * here when unwinding from exceptions raised by Unix libraries */
++    if (ptr > highest_user_address) return FALSE;
+     return (map[page / 64] >> (page & 63)) & 1;
+ }
+ 
+-- 
+2.56.0
+
