@@ -1,0 +1,116 @@
+From 2f8b3e4bc6ba5e0db6a6c79ba57614756b9379a4 Mon Sep 17 00:00:00 2001
+From: Yimin Yuan <yimin.yuan.93@gmail.com>
+Date: Mon, 9 Nov 2026 16:53:53 -0800
+Subject: [PATCH] Windows: Only validate code from host pages with repeated
+ write conflicts
+
+On hosts with pages larger than 4KiB, a write to a page no code was compiled from switched its whole host page to full SMC detection, although that write only faulted once its host page was trapped for code compiled from other pages. Code being unpacked hits this on every host page it is written to before it first runs, as with the code sections of GTA V, whose code then filled the 128MiB code buffer about every 17 seconds with larger code from those host pages that the disk cache can't store, recompiling ~100MiB on each reset and stalling the game for up to 400ms. Untrap the host page as for a write to compiled code instead, and only switch to full SMC detection once such a write faults again after code was compiled from the host page since, as then these writes keep alternating with execution. This also applies to file reads into such pages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Windows/Common/InvalidationTracker.cpp | 28 +++++++++++++++----
+ Source/Windows/Common/InvalidationTracker.h   |  9 ++++++
+ 2 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 6f7cb7623..d2e6d488b 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -265,16 +265,19 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+     // Unprotecting the faulting page makes its whole host page writable, so the host page must be invalidated and untrapped together.
+     const auto HostInterval = HostPageInterval(FaultAddress, 1);
+ 
+-    bool HasCode = true;
++    bool RepeatedWriteConflict = false;
+     if (HostPageMask != FEXCore::Utils::FEX_PAGE_MASK) {
+       std::scoped_lock Lock(CodePagesLock);
+-      HasCode = CodePages.Query(FaultAddress).Enclosed;
++      // A write that doesn't modify compiled code only faulted as its page shares a host page with trapped code
++      if (!CodePages.Query(FaultAddress).Enclosed) {
++        RepeatedWriteConflict = RecordWriteConflict(HostInterval);
++      }
+       CodePages.Remove(HostInterval);
+     }
+ 
+-    // If the write doesn't modify compiled code and only faulted as its page shares a host page with trapped code, which would
+-    // repeat on every such write, validate code from the host page before execution instead of trapping it.
+-    UntrapHostPage(HostInterval, !HasCode);
++    // Once such writes alternate with compiling code from the host page, they would fault each time it is trapped again, so validate
++    // code from the host page before execution instead of trapping it.
++    UntrapHostPage(HostInterval, RepeatedWriteConflict);
+     DetectMonoBackpatcherBlock(Thread, HostPc);
+     return true;
+   }
+@@ -302,14 +305,16 @@ void InvalidationTracker::PrepareUntrackedWrite(uint64_t Address, uint64_t Size)
+ 
+     // Writes to the pages code was compiled from still fault, as with host pages of FEX_PAGE_SIZE
+     const FEXCore::IntervalList<uint64_t>::Interval WriteInterval {std::max(Address, Page), std::min(Address + Size, PageInterval.End)};
++    bool RepeatedWriteConflict;
+     {
+       std::scoped_lock Lock(CodePagesLock);
+       if (!CodePages.Intersect(PageInterval) || CodePages.Intersect(WriteInterval)) {
+         continue;
+       }
+       CodePages.Remove(PageInterval);
++      RepeatedWriteConflict = RecordWriteConflict(PageInterval);
+     }
+-    UntrapHostPage(PageInterval, true);
++    UntrapHostPage(PageInterval, RepeatedWriteConflict);
+   }
+ }
+ 
+@@ -452,6 +457,16 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+   return true;
+ }
+ 
++bool InvalidationTracker::RecordWriteConflict(FEXCore::IntervalList<uint64_t>::Interval HostInterval) {
++  // A host page is only trapped again once code was compiled from it after the first such write, so only switching to full SMC
++  // detection on a repeated write keeps code from host pages written once, e.g. while code is being unpacked, fast and cacheable.
++  if (WriteConflictHostPages.Intersect(HostInterval)) {
++    return true;
++  }
++  WriteConflictHostPages.Insert(HostInterval);
++  return false;
++}
++
+ void InvalidationTracker::UntrapHostPage(FEXCore::IntervalList<uint64_t>::Interval HostInterval, bool FullSMCDetection) {
+   // IntervalsLock cannot be held during invalidation
+   std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+@@ -524,6 +539,7 @@ void InvalidationTracker::RemoveFreedHostPages(uint64_t Address, uint64_t Size)
+   FullSMCDetectionIntervals.Remove({Start, End});
+   std::scoped_lock Lock(CodePagesLock);
+   CodePages.Remove({Start, End});
++  WriteConflictHostPages.Remove({Start, End});
+ }
+ 
+ } // namespace FEX::Windows
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index c916fa457..8603f303b 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -68,6 +68,11 @@ private:
+   // Invalidates and untraps the host page, switching it to full SMC detection if requested.
+   void UntrapHostPage(FEXCore::IntervalList<uint64_t>::Interval HostInterval, bool FullSMCDetection);
+ 
++  // Records that the host page has to be untrapped for a write to one of its pages no code was compiled from, returning true if
++  // that already happened before, i.e. such writes keep alternating with compiling code from the host page.
++  // NOTE: Must be called with CodePagesLock held.
++  bool RecordWriteConflict(FEXCore::IntervalList<uint64_t>::Interval HostInterval);
++
+   // Untraps (restoring write) or traps (removing write) the RWX intervals within [Address, End).
+   // NOTE: Must be called with IntervalsLock held.
+   void SetRWXIntervalsProtection(uint64_t Address, uint64_t End, bool Untrap);
+@@ -105,6 +110,10 @@ private:
+   std::mutex CodePagesLock;
+   FEXCore::IntervalList<uint64_t> CodePages; // Protected by CodePagesLock
+ 
++  // Host pages that were untrapped for a write to one of their pages no code was compiled from, when host pages are larger than
++  // FEX_PAGE_SIZE.
++  FEXCore::IntervalList<uint64_t> WriteConflictHostPages; // Protected by CodePagesLock
++
+   bool MonoBackpatcherDetectionPending {false};
+   uint64_t MonoBase {0};
+   uint64_t MonoEnd {0};
+-- 
+2.56.0
+
